@@ -21,7 +21,7 @@ git clone https://github.com/REODigital/metabase-demo.git
 cd ~/metabase-demo
 ```
 
-### Install dependencies
+### Install dependencies (Only for the first time per instance)
 
 ```bash
 install nvm
