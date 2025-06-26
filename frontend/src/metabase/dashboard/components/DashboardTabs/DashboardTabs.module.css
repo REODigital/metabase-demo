@@ -1,0 +1,14 @@
+.dashboardTabs {
+  &.isNightMode {
+    --mb-color-border: var(--mb-color-text-medium);
+  }
+}
+
+.createTabButton {
+  border: none;
+  padding: 0.25rem;
+  margin-top: auto;
+  margin-bottom: auto;
+  position: relative;
+  top: -2px; /* Matches tab bottom border so this aligns vertically centered with tab labels */
+}

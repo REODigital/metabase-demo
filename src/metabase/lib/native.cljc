@@ -1,0 +1,405 @@
+(ns metabase.lib.native
+  "Functions for working with native queries."
+  (:require
+   [clojure.core.match :refer [match]]
+   [clojure.set :as set]
+   [clojure.string :as str]
+   [medley.core :as m]
+   [metabase.lib.metadata :as lib.metadata]
+   [metabase.lib.parse :as lib.parse]
+   [metabase.lib.query :as lib.query]
+   [metabase.lib.schema :as lib.schema]
+   [metabase.lib.schema.common :as common]
+   [metabase.lib.schema.id :as lib.schema.id]
+   [metabase.lib.schema.metadata :as lib.schema.metadata]
+   [metabase.lib.schema.template-tag :as lib.schema.template-tag]
+   [metabase.lib.util :as lib.util]
+   [metabase.util.humanization :as u.humanization]
+   [metabase.util.i18n :as i18n]
+   [metabase.util.malli :as mu]
+   [metabase.util.malli.registry :as mr]))
+
+(def ^:private variable-tag-regex
+  #"\{\{\s*([A-Za-z0-9_\.]+)\s*\}\}")
+
+(def ^:private snippet-tag-regex
+  #"\{\{\s*(snippet:\s*[^}]+)\s*\}\}")
+
+(def ^:private card-tag-regex
+  #"\{\{\s*(#([0-9]*)(-[a-z0-9-]*)?)\s*\}\}")
+
+(def ^:private tag-regexes
+  [variable-tag-regex snippet-tag-regex card-tag-regex])
+
+(defn- fresh-tag [tag-name]
+  {:type :text
+   :name tag-name
+   :id   (str (random-uuid))})
+
+(defn- fresh-function-tag [function-name args]
+  (case function-name
+    "mb.time_grouping" (let [param-name (first args)]
+                         (when (and (string? param-name)
+                                    (= (count args) 2)
+                                    (every? (comp not empty?) args))
+                           {:type :temporal-unit
+                            :name param-name
+                            :id (str (random-uuid))}))
+    nil))
+
+(defn- recognize-template-tags [query-text]
+  (let [parsed (lib.parse/parse {} query-text)]
+    (loop [found {}
+           [current & more] (vec parsed)]
+      (match [current]
+        [nil] found
+        [_ :guard string?] (recur found more)
+        [{:type ::lib.parse/param
+          :name tag-name}] (let [full-tag         (str "{{" tag-name "}}")
+                                 [_ matched-name] (some #(re-matches % full-tag) tag-regexes)]
+                             (recur (cond-> found
+                                      (and matched-name (not (found matched-name))) (assoc matched-name (fresh-tag matched-name)))
+                                    more))
+        [{:type ::lib.parse/function-param
+          :name function-name
+          :args args}] (let [new-tag (fresh-function-tag function-name args)]
+                         (if (and new-tag (not (found (:name new-tag))))
+                           (recur (assoc found (:name new-tag) new-tag) more)
+                           (recur found more)))
+        [{:type ::lib.parse/optional
+          :contents contents}] (recur found (apply conj more contents))))))
+
+(defn- tag-name->card-id [tag-name]
+  (when-let [[_ id-str] (re-matches #"^#(\d+)(-[a-z0-9-]*)?$" tag-name)]
+    (parse-long id-str)))
+
+(defn- tag-name->snippet-name [tag-name]
+  (when (str/starts-with? tag-name "snippet:")
+    (str/trim (subs tag-name (count "snippet:")))))
+
+(defn- finish-tag [{tag-name :name :as tag}]
+  (merge tag
+         (when-let [card-id (tag-name->card-id tag-name)]
+           {:type    :card
+            :card-id card-id})
+         (when-let [snippet-name (tag-name->snippet-name tag-name)]
+           {:type         :snippet
+            :snippet-name snippet-name})
+         (when-not (:display-name tag)
+           {:display-name (u.humanization/name->human-readable-name :simple tag-name)})))
+
+(defn- rename-template-tag
+  [existing-tags old-name new-name]
+  (let [old-tag       (get existing-tags old-name)
+        display-name  (if (= (:display-name old-tag)
+                             (u.humanization/name->human-readable-name :simple old-name))
+                        ;; Replace the display name if it was the default; keep it if customized.
+                        (u.humanization/name->human-readable-name :simple new-name)
+                        (:display-name old-tag))
+        new-tag       (-> old-tag
+                          (dissoc :snippet-name :card-id :snippet-id)
+                          (assoc :display-name display-name
+                                 :name         new-name))]
+    (-> existing-tags
+        (dissoc old-name)
+        (assoc new-name new-tag))))
+
+(defn- update-tags
+  [tags query-tags]
+  (into {}
+        (map (fn [[tag-name current-tag]]
+               (let [new-tag (query-tags tag-name)]
+                 ;; if a tag swapped to or from temporal unit, use the new tag instead of the old tag
+                 (if (and new-tag current-tag
+                          (not= (:type new-tag) (:type current-tag))
+                          (or (= (:type new-tag) :temporal-unit)
+                              (= (:type current-tag) :temporal-unit)))
+                   [tag-name new-tag]
+                   [tag-name current-tag]))))
+        tags))
+
+(defn- unify-template-tags
+  [query-tags query-tag-names existing-tags existing-tag-names]
+  (let [new-tags (set/difference query-tag-names existing-tag-names)
+        old-tags (set/difference existing-tag-names query-tag-names)
+        tags     (if (= 1 (count new-tags) (count old-tags))
+                   ;; With exactly one change, we treat it as a rename.
+                   (rename-template-tag existing-tags (first old-tags) (first new-tags))
+                   ;; With more than one change, just drop the old ones and add the new.
+                   (merge (m/remove-keys old-tags existing-tags)
+                          (m/filter-keys new-tags query-tags)))]
+    (-> (update-tags tags query-tags)
+        (update-vals finish-tag))))
+
+(mu/defn extract-template-tags :- ::lib.schema.template-tag/template-tag-map
+  "Extract the template tags from a native query's text.
+
+  If the optional map of existing tags previously parsed is given, this will reuse the existing tags where
+  they match up with the new one (in particular, it will preserve the UUIDs).
+
+  Given the text of a native query, extract a possibly-empty set of template tag strings from it.
+
+  These looks like mustache templates. For variables, we only allow alphanumeric characters, eg. `{{foo}}`.
+  For snippets they start with `snippet:`, eg. `{{ snippet: arbitrary text here }}`.
+  And for card references either `{{ #123 }}` or with the optional human label `{{ #123-card-title-slug }}`.
+
+  Invalid patterns are simply ignored, so something like `{{&foo!}}` is just disregarded."
+  ([query-text :- ::common/non-blank-string]
+   (extract-template-tags query-text nil))
+  ([query-text    :- ::common/non-blank-string
+    existing-tags :- [:maybe ::lib.schema.template-tag/template-tag-map]]
+   (let [query-tags         (recognize-template-tags query-text)
+         query-tag-names    (not-empty (set (keys query-tags)))
+         existing-tag-names (not-empty (set (keys existing-tags)))]
+     (if (or query-tag-names existing-tag-names)
+       ;; If there's at least some tags, unify them.
+       (unify-template-tags query-tags query-tag-names existing-tags existing-tag-names)
+       ;; Otherwise just an empty map, no tags.
+       {}))))
+
+(defn- assert-native-query! [stage]
+  (assert (= (:lib/type stage) :mbql.stage/native) (i18n/tru "Must be a native query")))
+
+(def ^:private all-native-extra-keys
+  #{:collection})
+
+(mr/def ::native-extras
+  [:map
+   [:collection {:optional true} ::common/non-blank-string]])
+
+(mu/defn required-native-extras :- set?
+  "Returns the extra keys that are required for this database's native queries, for example `:collection` name is
+  needed for MongoDB queries."
+  [metadata-providerable :- ::lib.schema.metadata/metadata-providerable]
+  (cond-> #{}
+    (lib.metadata/database-supports? metadata-providerable :native-requires-specified-collection)
+    (conj :collection)))
+
+(mu/defn with-native-extras :- ::lib.schema/query
+  "Updates the extras required for the db to run this query.
+   The first stage must be a native type. Will ignore extras not in `required-native-extras`"
+  [query :- ::lib.schema/query
+   native-extras :- [:maybe ::native-extras]]
+  (let [required-extras (required-native-extras query)]
+    (lib.util/update-query-stage
+     query 0
+     (fn [stage]
+       (let [extras-to-remove (set/difference all-native-extra-keys required-extras)
+             stage-without-old-extras (apply dissoc stage extras-to-remove)
+             result (merge stage-without-old-extras (select-keys native-extras required-extras))
+             missing-keys (set/difference required-extras (set (keys native-extras)))]
+         (assert-native-query! (lib.util/query-stage query 0))
+         (assert (empty? missing-keys)
+                 (i18n/tru "Missing extra, required keys for native query: {0}"
+                           (pr-str missing-keys)))
+         result)))))
+
+(mu/defn native-query :- ::lib.schema/query
+  "Create a new native query.
+
+  Native in this sense means a pMBQL query with a first stage that is a native query."
+  ([metadata-providerable     :- ::lib.schema.metadata/metadata-providerable
+    sql-or-other-native-query :- ::common/non-blank-string]
+   (native-query metadata-providerable sql-or-other-native-query nil nil))
+
+  ([metadata-providerable     :- ::lib.schema.metadata/metadata-providerable
+    sql-or-other-native-query :- ::common/non-blank-string
+    results-metadata          :- [:maybe ::lib.schema.metadata/stage]
+    native-extras             :- [:maybe ::native-extras]]
+   (let [tags (extract-template-tags sql-or-other-native-query)]
+     (-> (lib.query/query-with-stages metadata-providerable
+                                      [{:lib/type           :mbql.stage/native
+                                        :lib/stage-metadata results-metadata
+                                        :template-tags      tags
+                                        :native             sql-or-other-native-query}])
+         (with-native-extras native-extras)))))
+
+;; map of function names to min/max expected arguments
+(def ^:private function-expected-args
+  {"mb.time_grouping" {:args-count      [2 2]
+                       :args-validators [(comp not empty?) (comp not empty?)]}})
+
+(def ^:private tag-type->display-name
+  {:temporal-unit "time grouping"
+   :text "variable"
+   :card "card reference"
+   :snippet "snippet"})
+
+(defn- validate-function-tags
+  [query-text]
+  (let [parsed (lib.parse/parse {} query-text)]
+    (loop [found {}
+           errors []
+           [current & more] (vec parsed)]
+      (match [current]
+        [nil] errors
+        [_ :guard string?] (recur found errors more)
+        [{:type ::lib.parse/param
+          :name tag-name}]
+        (let [full-tag         (str "{{" tag-name "}}")
+              [_ matched-name] (some #(re-matches % full-tag) tag-regexes)
+              prev             (found matched-name)
+              current          (some-> matched-name fresh-tag finish-tag)
+              error            (cond
+                                 (not current)
+                                 (str "Syntax error in: " tag-name)
+
+                                 (and prev (not= (:type prev) (:type current)))
+                                 (str "Parameter " matched-name
+                                      " is used as both a " (-> prev :type tag-type->display-name)
+                                      " and a " (-> current :type tag-type->display-name)
+                                      ". This is not allowed.")
+
+                                 (function-expected-args matched-name)
+                                 (str matched-name " should be used as a function call, e.g. "
+                                      matched-name "('arg1', ...)"))]
+          (recur (cond-> found
+                   (and current (not error)) (assoc matched-name current))
+                 (cond-> errors
+                   error (conj error))
+                 more))
+        [{:type ::lib.parse/function-param
+          :name function-name
+          :args args}]
+        (let [current (fresh-function-tag function-name args)
+              args-count (count args)
+              {[args-min args-max] :args-count
+               :keys               [args-validators]} (function-expected-args function-name)
+              prev (some-> current :name found)
+              error (cond
+                      (not args-min)
+                      (str "Unknown function: " function-name)
+
+                      (< args-count args-min)
+                      (str function-name " got too few parameters.  Got "
+                           args-count ", expected at least " args-min ".")
+
+                      (> args-count args-max)
+                      (str function-name " got too many parameters.  Got "
+                           args-count ", expected at most " args-max ".")
+
+                      (not-every? identity (map #(%1 %2) args-validators args))
+                      (str function-name " got invalid parameters")
+
+                      (not current)
+                      (str "Invalid call to function: " function-name)
+
+                      (and prev (not= (:type prev) (:type current)))
+                      (str "Parameter " (:name current)
+                           " is used as both a " (-> prev :type tag-type->display-name)
+                           " and a " (-> current :type tag-type->display-name)
+                           ". This is not allowed."))]
+          (recur (cond-> found
+                   (and current (not error)) (assoc (:name current) current))
+                 (cond-> errors
+                   error (conj error))
+                 more))
+        [{:type ::lib.parse/optional
+          :contents contents}] (recur found errors (apply conj more contents))))))
+
+(defn validate-native-query
+  "Validates the syntax of a native query.
+
+  Native in this sense means a pMBQL query with a first stage that is a native query."
+  [query]
+  (let [sql (get-in query [:stages 0 :native])]
+    (validate-function-tags sql)))
+
+(mu/defn with-different-database :- ::lib.schema/query
+  "Changes the database for this query. The first stage must be a native type.
+   Native extras must be provided if the new database requires it."
+  [query :- ::lib.schema/query
+   metadata-provider :- ::lib.schema.metadata/metadata-providerable]
+  (assert-native-query! (lib.util/query-stage query 0))
+  (let [stages-without-fields (->> (:stages query)
+                                   (mapv (fn [stage]
+                                           (update stage :template-tags update-vals #(dissoc % :dimension)))))]
+    (lib.query/query-with-stages metadata-provider stages-without-fields)))
+
+(mu/defn native-extras :- [:maybe ::native-extras]
+  "Returns the extra keys for native queries associated with this query."
+  [query :- ::lib.schema/query]
+  (not-empty (select-keys (lib.util/query-stage query 0) (required-native-extras query))))
+
+(mu/defn with-native-query :- ::lib.schema/query
+  "Update the raw native query, the first stage must already be a native type.
+   Replaces templates tags"
+  [query :- ::lib.schema/query
+   inner-query :- ::common/non-blank-string]
+  (lib.util/update-query-stage
+   query 0
+   (fn [{existing-tags :template-tags :as stage}]
+     (assert-native-query! stage)
+     (assoc stage
+            :native inner-query
+            :template-tags (extract-template-tags inner-query existing-tags)))))
+
+(mu/defn with-template-tags :- ::lib.schema/query
+  "Updates the native query's template tags."
+  [query :- ::lib.schema/query
+   tags :- ::lib.schema.template-tag/template-tag-map]
+  (lib.util/update-query-stage
+   query 0
+   (fn [{existing-tags :template-tags :as stage}]
+     (assert-native-query! stage)
+     (let [valid-tags (keys existing-tags)]
+       (assoc stage :template-tags
+              (merge existing-tags (select-keys tags valid-tags)))))))
+
+(mu/defn raw-native-query :- ::common/non-blank-string
+  "Returns the native query string"
+  [query :- ::lib.schema/query]
+  (:native (lib.util/query-stage query 0)))
+
+(mu/defn template-tags :- [:maybe ::lib.schema.template-tag/template-tag-map]
+  "Returns the native query's template tags"
+  [query :- ::lib.schema/query]
+  (:template-tags (lib.util/query-stage query 0)))
+
+(mu/defn template-tag-card-ids :- [:maybe [:set {:min 1} ::lib.schema.id/card]]
+  "Returns the card IDs from the template tags of the native query of `query`."
+  [query :- ::lib.schema/query]
+  (not-empty (into #{} (keep (fn [[_k m]] (:card-id m))) (template-tags query))))
+
+(mu/defn template-tags-referenced-cards :- [:maybe [:sequential ::lib.schema.metadata/card]]
+  "Returns Card instances referenced by the given native `query`."
+  [query :- ::lib.schema/query]
+  (mapv
+   (fn [card-id]
+     (lib.metadata/card query card-id))
+   (template-tag-card-ids query)))
+
+(mu/defn has-template-tag-variables? :- :boolean
+  "Tests whether `query` has any template-tag variables.
+
+  That is, any `:template-tags` values with `:type` other than `:snippet` or `:card`."
+  [query :- ::lib.schema/query]
+  (letfn [(variable-tag? [{tag-type :type}]
+            (not (#{:snippet :card} tag-type)))]
+    (boolean (some variable-tag? (vals (template-tags query))))))
+
+(mu/defn has-write-permission :- :boolean
+  "Returns whether the database has native write permissions.
+   This is only filled in by [[metabase.warehouses.api/add-native-perms-info]]
+   and added to metadata when pulling a database from the list of dbs in js."
+  [query :- ::lib.schema/query]
+  (assert-native-query! (lib.util/query-stage query 0))
+  (= :write (:native-permissions (lib.metadata/database query))))
+
+(defmethod lib.query/can-run-method :mbql.stage/native
+  [query _card-type]
+  (and
+   (set/subset? (required-native-extras query)
+                (set (keys (native-extras query))))
+   (not (str/blank? (raw-native-query query)))
+   (every? #(if (= :dimension (:type %))
+              (:dimension %)
+              true)
+           (vals (template-tags query)))))
+
+(mu/defn engine :- [:maybe :keyword]
+  "Returns the database engine.
+   Must be a native query"
+  [query :- ::lib.schema/query]
+  (assert-native-query! (lib.util/query-stage query 0))
+  (:engine (lib.metadata/database query)))

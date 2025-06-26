@@ -1,0 +1,5 @@
+{:paths
+ ["src" "resources"]
+
+ :deps
+ {net.snowflake/snowflake-jdbc-thin {:mvn/version "3.24.2"}}}
