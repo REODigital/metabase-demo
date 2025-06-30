@@ -1,4 +1,4 @@
-import { useCallback, useMemo } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { t } from "ttag";
 import _ from "underscore";
 
@@ -27,16 +27,21 @@ import {
 export const LanguageStep = ({ stepLabel }: NumberedStepProps): JSX.Element => {
   const { isStepActive, isStepCompleted } = useStep("language");
   const locale = useSelector(getLocale);
+  const [selectedLocale, setSelectedLocale] = useState<Locale | undefined>(
+    locale,
+  );
+
   const localeData = useSelector(getAvailableLocales);
   const fieldId = useMemo(() => _.uniqueId(), []);
   const locales = useMemo(() => getLocales(localeData), [localeData]);
   const dispatch = useDispatch();
 
-  const handleLocaleChange = (locale: Locale) => {
-    dispatch(updateLocale(locale));
+  const handleLocaleSelectionChange = (locale: Locale) => {
+    setSelectedLocale(locale);
   };
 
   const handleStepSubmit = () => {
+    dispatch(updateLocale(selectedLocale as Locale));
     dispatch(goToNextStep());
   };
 
@@ -65,7 +70,7 @@ export const LanguageStep = ({ stepLabel }: NumberedStepProps): JSX.Element => {
             locale={item}
             checked={item.code === locale?.code}
             fieldId={fieldId}
-            onLocaleChange={handleLocaleChange}
+            handleLocaleSelectionChange={handleLocaleSelectionChange}
           />
         ))}
       </LocaleGroup>
@@ -84,18 +89,18 @@ export interface LocaleItemProps {
   locale: Locale;
   checked: boolean;
   fieldId: string;
-  onLocaleChange: (locale: Locale) => void;
+  handleLocaleSelectionChange: (locale: Locale) => void;
 }
 
 const LocaleItem = ({
   locale,
   checked,
   fieldId,
-  onLocaleChange,
+  handleLocaleSelectionChange,
 }: LocaleItemProps): JSX.Element => {
   const handleChange = useCallback(() => {
-    onLocaleChange(locale);
-  }, [locale, onLocaleChange]);
+    handleLocaleSelectionChange(locale);
+  }, [locale, handleLocaleSelectionChange]);
 
   return (
     <LocaleLabel key={locale.code}>
