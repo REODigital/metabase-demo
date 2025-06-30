@@ -3,7 +3,7 @@ import { css } from "@emotion/react";
 // eslint-disable-next-line no-restricted-imports
 import styled from "@emotion/styled";
 
-import { alpha } from "metabase/lib/colors";
+import { alpha, getFocusColor } from "metabase/lib/colors";
 
 interface ButtonRootProps {
   purple?: boolean;
@@ -20,6 +20,16 @@ export const ButtonRoot = styled.button<ButtonRootProps>`
     &:hover {
       transition: none;
     }
+  }
+
+  &:focus-visible {
+    outline: 4px solid ${getFocusColor("brand")};
+    outline-offset: 4px;
+    border-radius: 4px;
+  }
+
+  &:focus:not(:focus-visible) {
+    outline: none;
   }
 
   ${({ purple, theme }) =>

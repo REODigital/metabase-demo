@@ -26,7 +26,7 @@ interface EngineCardRootProps {
   isActive: boolean;
 }
 
-export const EngineCardRoot = styled.button<EngineCardRootProps>`
+export const EngineCardRoot = styled(Button)<EngineCardRootProps>`
   display: flex;
   flex: 1 1 auto;
   flex-direction: column;
@@ -44,6 +44,14 @@ export const EngineCardRoot = styled.button<EngineCardRootProps>`
     border-color: var(--mb-color-brand);
     background-color: ${() => lighten("brand", 0.6)};
   }
+`;
+
+export const AnnouncementWrapper = styled.div`
+  position: absolute;
+  left: -9999px;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
 `;
 
 export const EngineCardTitle = styled.div`

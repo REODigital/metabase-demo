@@ -1,7 +1,8 @@
 import type { ChangeEvent, KeyboardEvent } from "react";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { jt, t } from "ttag";
 
+import { Label } from "metabase/admin/databases/components/DatabaseFeatureComponents";
 import ExternalLink from "metabase/common/components/ExternalLink";
 import Input from "metabase/common/components/Input";
 import { useDocsUrl } from "metabase/common/hooks";
@@ -11,6 +12,7 @@ import type { EngineOption } from "../../types";
 import { getEngineLogo } from "../../utils/engine";
 
 import {
+  AnnouncementWrapper,
   EngineButtonRoot,
   EngineCardIcon,
   EngineCardImage,
@@ -99,6 +101,7 @@ const EngineSearch = ({
 }: EngineSearchProps): JSX.Element => {
   const rootId = useUniqueId();
   const [searchText, setSearchText] = useState("");
+  const [announcement, setAnnouncement] = useState("");
   const [activeIndex, setActiveIndex] = useState<number>();
   const [isExpanded, setIsExpanded] = useState(false);
   const isSearching = searchText.length > 0;
@@ -136,12 +139,22 @@ const EngineSearch = ({
     [activeIndex, activeOption, optionCount, onChange],
   );
 
+  useEffect(() => {
+    if (visibleOptions.length) {
+      setAnnouncement(`${visibleOptions.length} databases found`);
+    } else {
+      setAnnouncement("No databases found");
+    }
+  }, [visibleOptions]);
+
   return (
     <EngineSearchRoot role="combobox">
+      <Label htmlFor="email">{t`Search for a database…`}</Label>
       <Input
         value={searchText}
-        placeholder={t`Search for a database…`}
+        id="email"
         autoFocus
+        role="combobox"
         aria-autocomplete="list"
         aria-controls={getListBoxId(rootId)}
         aria-activedescendant={getListOptionId(rootId, activeOption)}
@@ -165,6 +178,9 @@ const EngineSearch = ({
           onExpandedChange={setIsExpanded}
         />
       )}
+      <AnnouncementWrapper aria-live="polite">
+        {announcement}
+      </AnnouncementWrapper>
     </EngineSearchRoot>
   );
 };
